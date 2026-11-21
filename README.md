@@ -1,239 +1,238 @@
-<p align="center">
-  <img src=".github/logo.svg" alt="Arandu" width="180">
-</p>
+# Arandu Translate
 
-# Translate
+One Go interface for machine translation, and a driver for each provider behind
+it.
 
-An Arandu package. It registers its own routes, owns its own table, and decides
-for itself who may reach either.
+An application depends on `translate.Translator` and never on a provider. Today
+the drivers are **DeepL** and **LibreTranslate**; `translate.Fallback` chains
+them so the first one that answers is used, and `translate.NewFake` stands in for
+all of them in tests. It imports the standard library only, registers nothing and
+owns no table: there is no module to wire, no route and no migration.
+
+The package starts small and grows with the providers its users ask for. The
+candidates are Google Cloud Translation, Azure Translator, Amazon Translate and
+ModernMT; each arrives as one more driver, with the interface unchanged.
+
+## What it is not
+
+- **It does not come with a key.** The API key belongs to whoever holds the
+  account with the provider, and every request spends that account's characters.
+  Keep it in the environment, never in the repository.
+- **It does not store translations.** There is no cache and no table. Keeping a
+  translation, and deciding when it is stale, is the application's job.
+- **It is not a judge of quality.** Machine translation is a draft. A text that
+  carries legal, medical or brand weight needs a person.
+
+## Privacy
+
+The text an application translates **leaves the process and goes to the
+provider**: to DeepL's servers, or to the LibreTranslate server the application
+points at. Before sending anything a user wrote, know what that provider does
+with it.
+
+- **DeepL API Free and API Pro are different contracts.** They differ in how the
+  texts are retained and in whether they may be used to improve the service. Read
+  DeepL's current terms, and use API Pro (or a self-hosted LibreTranslate) for
+  personal or confidential text. A key ending in `:fx` is a Free key.
+- **LibreTranslate** keeps the text where you host it. A server run by somebody
+  else is that operator's to answer for.
+- Tell the people whose text is translated, in the application's privacy notice,
+  which providers receive it.
 
 ## Install
 
-```bash
-go get github.com/hyz-is/arandu-translate
+```sh
+go get github.com/hyz-is/arandu-translate@v0.1.0
 ```
 
-## Wire it
+Go 1.26.10 or later.
 
-An Arandu application registers a module explicitly. There is no service
-provider, no container and no discovery, so these are the lines to paste into
-`bootstrap/app.go`, and the views add one import below.
-
-The import, with the other module imports:
+## Use
 
 ```go
+package main
+
 import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+
 	translate "github.com/hyz-is/arandu-translate"
 )
-```
 
-The construction, in `App`, once `NewAppServiceProvider` has returned. `New`
-refuses a wiring that cannot work and `Configure` has no way to return that
-error, so the module is built where the error can leave; the database and the
-session store are the ones the framework built from the configuration:
-
-```go
-	translateModule, err := translate.New(translate.Config{}, drivers.DB, drivers.Sessions)
+func main() {
+	deepl, err := translate.NewDeepL(translate.DeepLConfig{APIKey: os.Getenv("DEEPL_API_KEY")})
 	if err != nil {
-		_ = drivers.Close()
-		return nil, err
+		panic(err)
 	}
-```
-
-And the registration, in the `WithProviders(...)` chain the builder is made of:
-
-```go
-	return Configure(cfg, drivers, app).
-		WithProviders(translateModule).
-		WithVersion(version, commit).
-		Create()
-```
-
-Then, once, before the application serves:
-
-```bash
-aru migrate
-```
-
-This package owns a table, which is why the migration step is not optional and
-why `arandu.mod.toml` says `migrations = true`.
-
-## Publish the views
-
-This package carries the markup of its own pages and hands it over instead of
-rendering it from the inside, because a page you cannot edit is a page that says
-the wrong thing in your product.
-
-Look at what would be written, then write it:
-
-```bash
-aru vendor:publish --tag=view
-aru vendor:publish --tag=view --apply
-```
-
-Nothing is written without `--apply`. The preview lists every file as `create`,
-`update`, `unchanged` or `conflict`, and running the command a second time
-writes nothing. A file changed outside its `arandu:begin custom` markers is
-reported as a conflict and left alone; `--force` publishes over one, and even
-then what is inside the markers is carried forward.
-
-The files land under `resources/views/modules/translate/`, and from that point
-they are yours. Nothing of this package is compiled beside them, so no view name
-is registered twice and no rule has to decide which of two files won — the
-consequence being that a view of this package that changes later does not reach
-a project that already published it.
-
-Two steps are left to you, and they are left to you because a command that
-edited `bootstrap/app.go` behind your back is a command whose output nobody can
-explain. Compile what was written:
-
-```bash
-aru view:build
-```
-
-and import the directory it wrote into, with the other imports:
-
-```go
-	_ "your/module/path/storage/framework/views/modules/translate"
-```
-
-Without that import the views are not in the binary, and the module refuses to
-boot rather than answering the first request that reaches one of them with a
-500. The refusal names the view, the command and the import.
-
-## Configuration
-
-| field | required | meaning |
-| --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/translate`. |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200. |
-
-The zero `Config{}` is a valid configuration. There is no tenant to set: every
-route needs a session, and the tenant of every statement is the one on the
-Grant of whoever is signed in.
-
-`New` returns an error rather than starting half-wired, so a setting that
-cannot work fails where it is written instead of on the first request that
-needed it.
-
-## Routes
-
-| method | path | name |
-| --- | --- | --- |
-| `GET` | `/translate` | `translate.index` |
-| `GET` | `/translate/{id}` | `translate.show` |
-| `POST` | `/translate` | `translate.store` |
-
-Every one of them sits behind `RequireAuth`: a visitor with no session is sent
-to `/auth/login`, and the handler of a request that has one reads who is asking
-with `ctx.User()`. Behind the guard, every route is refused until the policy is
-opened. That is the state the package ships in, and it is deliberate.
-
-A handler returns the error the service returned, and the router answers it: a
-policy refusal is 403, a record that is not there is 404, and a rejected input
-goes back where it came from with the messages in the flash. A request that asks
-for JSON gets the same statuses as `application/problem+json` documents, and a
-rejected input as a 422 with the messages keyed by field. No handler maps an
-error to a status itself.
-
-## Open the policy
-
-`policy.go` denies every action and has no branch that allows one. Open what
-this package needs, one action at a time, inside the custom block:
-
-```go
-	// arandu:begin custom
-	if a == TranslateView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
+	libre, err := translate.NewLibreTranslate(translate.LibreConfig{
+		BaseURL: os.Getenv("LIBRETRANSLATE_URL"), // for example http://localhost:5000
+		APIKey:  os.Getenv("LIBRETRANSLATE_API_KEY"),
+	})
+	if err != nil {
+		panic(err)
 	}
-	// arandu:end custom
+
+	// Depend on the interface. DeepL first; LibreTranslate when DeepL fails.
+	var t translate.Translator = translate.Fallback(deepl, libre)
+
+	result, err := t.Translate(context.Background(), translate.Request{
+		Text:   []string{"Pronostics, foot, classement", "Bienvenue"},
+		Source: "fr", // empty detects the language
+		Target: "pt-BR",
+	})
+	switch {
+	case errors.Is(err, translate.ErrQuotaExceeded):
+		fmt.Println("every provider is out of quota")
+	case errors.Is(err, translate.ErrUnauthorized):
+		fmt.Println("a provider refused its key")
+	case errors.Is(err, translate.ErrUnsupportedLanguage):
+		fmt.Println("no provider translates into this language")
+	case err != nil:
+		panic(err)
+	}
+	fmt.Println(result.Provider, result.DetectedSource, result.Text)
+}
 ```
 
-What is not written there stays closed, including every action added later.
+### The interface
 
-## The data path
+```go
+type Translator interface {
+	Translate(ctx context.Context, r Request) (Result, error)
+	Languages(ctx context.Context) ([]string, error) // targets, BCP 47
+	Name() string
+}
 
-`Translate` embeds `model.Model`, and `translateTable`, beside it in `model.go`,
-declares its table once. `aru model:build` generates `TranslateQuery.go` from
-it: `Translates(db)`, which starts a `*TranslateQuery`, and `TranslateCollection`.
-The file is committed and never edited by hand; regenerate it after changing
-the entity, and `aru model:build --check` fails when it is out of date.
+type Request struct {
+	Text   []string // one or more short texts, answered in the same order
+	Source string   // BCP 47 ("fr"); empty detects it
+	Target string   // BCP 47 ("pt-BR", "zh-Hans", "ar")
+	Format string   // "text" (the default) or "html"
+}
 
-`TranslateService` owns `*data.DB` and follows
-`validate -> security.Authorize -> Grant -> Model terminal`; handlers never hold
-the database or start a query. Every query starts at `Translates(s.db)`: the
-constructor returns one mutable query, so a second chain begun from a value held
-in a variable would carry the clauses of the first.
-
-Create builds the row with `Translates(s.db).New()` and writes `TenantID` from
-`data.Tenant(g)`. Find authorizes before reading and again against the row it
-found. List authorizes before building its scoped, allowlisted query. The table
-keeps its default `tenant_id` scope on every terminal.
-
-Terminals return `*Translate` and `[]*Translate`. Keep those pointers: a copy of a
-row keeps the model of the original, and the model refuses to write through it
-with `model.ErrUnwired`. `Resource` and `Collection` are explicit response
-snapshots and do not expose tenant or Model internals.
-
-The rules of the entity itself — an invariant, a derived value, a transition
-such as `Rename` guarded by `CanRename` — go in the custom block of `model.go`,
-as pure methods: no database, no network, no clock read inside, no Grant. The
-service orchestrates: it validates, authorizes, calls those rules and saves
-with the Grant.
-
-There is no CRUD Repository. Add one only for a complex query, read model,
-report, export or raw SQL contract that the generated query cannot express.
-
-## Layout
-
-```
-module.go         registration, routes, handlers and migrations
-config.go         what the application passes in
-model.go          the entity, its table and its own rules, and what it may answer with
-TranslateQuery.go  the query aru model:build generates from model.go
-policy.go         who may do what
-service.go        the use cases, and Model access after authorization
-views.go          the files the application takes ownership of
+type Result struct {
+	Text           []string
+	DetectedSource string // what the provider says the language was, if it says
+	Provider       string // the Name of the translator that answered
+}
 ```
 
-## What is already correct, and has to stay that way
+Languages are BCP 47 on both sides. Each driver turns a tag into the code its
+provider wants, and a provider's codes into tags again in `Languages`. An empty
+text is answered with itself and never sent, so it costs no characters.
+`Format: "html"` keeps the tags and translates the text between them.
 
-**The policy denies everything.** There is no permit-all branch to delete
-later. The Service calls `security.Authorize` before its first `Translates(db)`
-reach, and every Model terminal requires the Grant that call produced.
+### DeepL
 
-**Authorization precedes the Model.** The package audit checks that order in
-every exported Service method. A Model terminal enforces tenant scope; the
-preceding Policy call decides whether the action itself is allowed.
+```go
+translate.NewDeepL(translate.DeepLConfig{
+	APIKey: "...:fx", // ":fx" selects api-free.deepl.com, anything else api.deepl.com
+})
+```
 
-**The tenant comes from `data.Tenant(g)`.** Never from the path, the body, the
-query string or a header. The value on the Grant came from the session; a value
-that arrived with the request is a value the caller chose.
+`DeepLConfig` takes the key, and optionally `BaseURL`, `HTTPClient`, `Timeout`
+(15 seconds by default, applied to every request), `EnglishTarget` and
+`PortugueseTarget`. The key travels in `Authorization: DeepL-Auth-Key`.
 
-**Who is asking comes from the guard.** `RequireAuth` loads the session once and
-puts the subject on the request; nothing in the module loads it again.
+DeepL names the variant of a target language where there is one, so the driver
+maps tags like this:
 
-**`arandu.mod.toml` declares what the package does** — network, filesystem,
-exec, migrations — and the suite compares the declaration against what the code
-*calls*, not against what it imports: `net/http` is imported by everything with
-a route and says nothing. A package that says it makes no outbound calls and
-then opens one fails its own tests, and that is the only place the comparison
-happens. `aru doctor` audits the application it is run inside and never loads a
-dependency, so nothing audits an installed package except the package itself.
+| BCP 47 | DeepL target |
+| --- | --- |
+| `pt-BR` | `PT-BR` |
+| `pt-PT`; `pt` | `PT-PT`; `PortugueseTarget` (`PT-PT` by default) |
+| `en-GB`, `en-AU`, ...; `en-US`, `en-CA`, ... | `EN-GB`; `EN-US` |
+| `en` | `EnglishTarget` (`EN-GB` by default, or `EN-US`) |
+| `zh-Hans`, `zh`, `zh-CN` | `ZH-HANS` |
+| `zh-Hant`, `zh-TW`, `zh-HK` | `ZH-HANT` |
+| `es-419` | `ES-419` |
+| `ar`, `ja`, `ru`, `de`, `it`, `es`, `fr`, ... | the language in capitals |
 
-## Tests
+A source has no variant: `pt-BR`, `en-US` and `zh-Hans` are sent as `PT`, `EN`
+and `ZH`. A language DeepL does not know is refused by DeepL and arrives as
+`ErrUnsupportedLanguage`. `Languages` lists DeepL's targets, so an application
+can offer only what the account can translate.
 
-```bash
+A list is sent in calls of at most fifty texts and 64 KiB, and the answers are
+put back in order.
+
+### LibreTranslate
+
+```go
+translate.NewLibreTranslate(translate.LibreConfig{
+	BaseURL: "http://localhost:5000", // required: the server is yours or somebody's
+	APIKey:  "",                      // only if the server asks for one
+})
+```
+
+LibreTranslate codes are the language alone (`pt-BR` is sent as `pt`), with the
+two Chinese scripts as `zh` and `zt`; `Languages` answers them as `zh-Hans` and
+`zh-Hant`. What a server translates depends on the models its operator installed.
+
+### Errors
+
+Test them with `errors.Is`.
+
+| error | DeepL | LibreTranslate |
+| --- | --- | --- |
+| `ErrUnauthorized` | HTTP 403 | HTTP 403, or a 400 about the API key |
+| `ErrQuotaExceeded` | HTTP 456, and 429 or 529 | HTTP 429 |
+| `ErrUnsupportedLanguage` | a 400 saying a language is not supported, or a tag that is not BCP 47 | a 400 saying a language is not supported |
+
+Any other refusal is an error carrying the provider's message. No error carries
+the API key. The package does not retry: waiting spends the caller's time and
+the account's allowance, and only the application knows how long it can wait.
+
+### Fallback
+
+`translate.Fallback(a, b, c)` returns a `Translator`. `Translate` tries each in
+order and returns the first answer without an error, with `Result.Provider`
+naming who gave it. When every translator fails, the error joins theirs, so
+`errors.Is` finds each cause. A cancelled context stops the chain. `Languages` is
+the union of what the translators list.
+
+Any error moves to the next translator, including `ErrUnsupportedLanguage`, so a
+language only the second provider knows still gets translated.
+
+## Test your own code
+
+`NewFake` returns a `Translator` that never touches the network and answers
+`[<target>] <text>`:
+
+```go
+fake := translate.NewFake()
+got, _ := fake.Translate(ctx, translate.Request{Text: []string{"bonjour"}, Source: "fr", Target: "pt-BR"})
+// got.Text is []string{"[pt-BR] bonjour"}
+
+fake.SetLanguages([]string{"en", "pt-BR"}) // other targets now fail with ErrUnsupportedLanguage
+fake.FailWith(translate.ErrQuotaExceeded)  // every call now fails; FailWith(nil) undoes it
+sent := fake.Requests()                    // what the code under test asked for
+```
+
+## The manifest
+
+`arandu.mod.toml` declares `network = true` and nothing else: the package sends
+requests to the provider a driver is built for. `tests/Unit/audit_test.go`
+compares the declaration with what the code calls.
+
+## Development
+
+```sh
+export GOWORK=off
+gofmt -l $(find . -name '*.go' -not -path '*/testdata/*' -not -name '*.kyse.go')
+go build ./...
+go vet ./...
 go test -race ./...
 ```
 
-The denial suite constructs the Service with a nil database, so even building
-`Translates(nil)` would panic. The structural twin reads the allowed path and
-rejects any Service method that reaches the Model before `Authorize`, and any
-handler that loads the session or picks a status itself. The route tests drive
-the module with no session, with a signed-in subject and with a rejected input,
-on that same handle over no database.
+No test reaches the network: each provider is a local `httptest` server with JSON
+written by hand from its public documentation.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [CHANGELOG.md](CHANGELOG.md) and
+[UPGRADE.md](UPGRADE.md). Vulnerabilities follow [SECURITY.md](SECURITY.md).
 
 ## Licence
 
-MIT. See [LICENSE.md](LICENSE.md). Copyright HYZIS.
+MIT, see [LICENSE.md](LICENSE.md).

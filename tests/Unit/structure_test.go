@@ -6,207 +6,129 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 )
 
-// TestTheApplicationIntegrationHasOneCompositionFile keeps the package's
-// installation surface as explicit as its constructor. A package is composed
-// in bootstrap/app.go; another bootstrap file would be another place a reader
-// has to search to learn what the application contains.
-func TestTheApplicationIntegrationHasOneCompositionFile(t *testing.T) {
+// TestThePackageIsALibrary holds the shape of this repository: the standard
+// library and nothing else, no route, no table, no policy, nothing to register.
+//
+// Each of those is a door to something the package deliberately does not do. A
+// route would answer requests with no Grant behind them, a table would be a
+// migration every installer has to run, and a framework import would make a
+// translation depend on the application kernel. Translating a text is a call
+// the application makes with values it already has.
+func TestThePackageIsALibrary(t *testing.T) {
 	t.Parallel()
 
 	root := packageRoot(t)
-	guides := []string{
-		"README.md",
-		".agents/skills/translate-package/SKILL.md",
-	}
-	bootstrapFile := regexp.MustCompile(`bootstrap/[A-Za-z0-9_.-]+\.go`)
-
-	for _, guide := range guides {
-		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(guide)))
-		if err != nil {
-			t.Fatalf("reading %s: %v", guide, err)
-		}
-
-		text := string(body)
-		for _, required := range []string{"bootstrap/app.go", "translate.New(", "WithProviders"} {
-			if !strings.Contains(text, required) {
-				t.Errorf("%s no longer teaches the explicit composition step %q", guide, required)
-			}
-		}
-
-		for _, referenced := range bootstrapFile.FindAllString(text, -1) {
-			if referenced != "bootstrap/app.go" {
-				t.Errorf("%s introduces a second composition file %s", guide, referenced)
-			}
-		}
-	}
-}
-
-// TestThePackageHasOneOwnerPerResponsibility freezes the application shapes
-// this package is allowed to introduce, including one Service owner for Model
-// access and no parallel composition abstraction.
-func TestThePackageHasOneOwnerPerResponsibility(t *testing.T) {
-	t.Parallel()
-
-	root := packageRoot(t)
-	forbiddenPaths := []string{
-		"app/Actions",
-		"app/Data",
-		"app/Rules",
-		"app/Support",
-		"bootstrap/providers.go",
-		"routes/api.go",
-		"routes/channels.go",
-		"public/assets/manifest",
-		"public/assets/manifest.json",
-	}
-
-	for _, path := range forbiddenPaths {
-		if _, err := os.Lstat(filepath.Join(root, filepath.FromSlash(path))); err == nil {
-			t.Errorf("refused application path %s exists in the package template", path)
+	for _, path := range []string{
+		"module.go", "model.go", "policy.go", "service.go", "views.go",
+		"resources", "migrations", "database", "routes", "bootstrap",
+	} {
+		if _, err := os.Lstat(filepath.Join(root, path)); err == nil {
+			t.Errorf("%s exists; this package registers nothing, owns no table and decides no authorization", path)
 		} else if !os.IsNotExist(err) {
-			t.Errorf("checking refused application path %s: %v", path, err)
+			t.Errorf("checking %s: %v", path, err)
 		}
 	}
 
-	inspectExplicitComposition(t, root)
-	inspectServiceBoundary(t, root)
+	refusedMethods := map[string]string{
+		"Routes":     "a route",
+		"Migrations": "a table",
+		"Boot":       "a boot step",
+		"Publishes":  "a publication",
+		"Authorize":  "an authorization decision",
+	}
+	for _, source := range productionGoFiles(t, root) {
+		for _, imported := range source.file.Imports {
+			path, err := strconv.Unquote(imported.Path.Value)
+			if err != nil {
+				t.Errorf("%s has an unreadable import %s", source.path, imported.Path.Value)
+				continue
+			}
+			if first, _, _ := strings.Cut(path, "/"); strings.Contains(first, ".") {
+				t.Errorf("%s imports %s; production code may import the standard library only", source.path, path)
+			}
+		}
+
+		ast.Inspect(source.file, func(node ast.Node) bool {
+			switch node := node.(type) {
+			case *ast.TypeSpec:
+				if node.Name.Name == "Module" || strings.HasSuffix(node.Name.Name, "ServiceProvider") {
+					t.Errorf("%s declares %s; there is nothing to register", source.path, node.Name.Name)
+				}
+			case *ast.FuncDecl:
+				if what, refused := refusedMethods[node.Name.Name]; refused && node.Recv != nil {
+					t.Errorf("%s declares %s.%s, which is %s this package does not have",
+						source.path, receiverType(node), node.Name.Name, what)
+				}
+				if node.Recv == nil && node.Name.Name == "init" {
+					t.Errorf("%s declares init; the package does nothing because it was imported", source.path)
+				}
+			}
+			return true
+		})
+	}
 }
 
-// The spellings of the generic model layer, in halves so this file does not
-// carry them whole. Hesape removed that layer, and an entity written against it
-// does not compile -- but a guide that teaches it does, and so does a comment
-// that a configured copy would read as the way to write the next entity.
-const (
-	genericOpen      = "["
-	genericModel     = "model.Model" + genericOpen
-	genericBuilder   = "model.Builder" + genericOpen
-	genericRows      = "model.Collection" + genericOpen
-	genericFactory   = "Factory" + genericOpen
-	genericNewModel  = "model.NewModel" + genericOpen
-	genericInstance  = "NewInstance" + "("
-	generatedHeading = "// Code generated by aru model:build" + " from model.go. DO NOT EDIT."
-)
-
-// TestThePackageUsesTheGeneratedConcreteModel freezes the package shape promised
-// to every configured copy: the entity embeds the non-generic Model, its table
-// is declared once beside it, the query aru model:build generates is the one way
-// in, the entity keeps a custom block for its own rules, the Service owns the
-// database handle, and CRUD does not grow a Repository layer of its own.
-func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
+// TestThePackageNamesNoHostButDeepL holds where the text can go. The text an
+// application translates is sent to a provider, so the only address written in
+// the code is DeepL's own; a LibreTranslate server is the one the application
+// gives in its configuration, and nothing else is reachable.
+func TestThePackageNamesNoHostButDeepL(t *testing.T) {
 	t.Parallel()
 
-	root := packageRoot(t)
-	if _, err := os.Lstat(filepath.Join(root, "repository.go")); err == nil {
-		t.Error("repository.go still exists; CRUD belongs to the generated query")
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("checking repository.go: %v", err)
+	allowed := map[string]bool{
+		"https://api.deepl.com":      true,
+		"https://api-free.deepl.com": true,
 	}
-
-	wants := map[string][]string{
-		"model.go": {
-			`"github.com/arandu-io/hesape/database/model"`,
-			"type Translate struct {\n\tmodel.Model\n",
-			"var translateTable = model.NewTable(model.TableSpec{",
-			"ManualKey: true,",
-			"// arandu:begin custom\n",
-			"// arandu:end custom\n",
-		},
-		"TranslateQuery.go": {
-			generatedHeading,
-			"func Translates(db model.DB) *TranslateQuery",
-			"type TranslateCollection []*Translate",
-		},
-		"service.go": {
-			"db     *data.DB",
-			"func NewTranslateService(db *data.DB) *TranslateService",
-			"Translates(s.db).New()",
-			"Translates(s.db).WhereKey(",
-			") (*Translate, error)",
-			") ([]*Translate, error)",
-		},
-		"module.go": {
-			"NewTranslateService(db)",
-		},
-	}
-	for path, required := range wants {
-		body, err := os.ReadFile(filepath.Join(root, path))
-		if err != nil {
-			t.Fatalf("reading %s: %v", path, err)
-		}
-		for _, want := range required {
-			if !strings.Contains(string(body), want) {
-				t.Errorf("%s does not contain %q", path, want)
+	for _, source := range productionGoFiles(t, packageRoot(t)) {
+		ast.Inspect(source.file, func(node ast.Node) bool {
+			literal, ok := node.(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
 			}
-		}
-	}
-
-	// Every Go file, tests included, because a test written against the generic
-	// layer is the example the next test is copied from.
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() && (entry.Name() == ".git" || entry.Name() == "testdata") {
-			return filepath.SkipDir
-		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
-			return nil
-		}
-		body, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		for _, stale := range []string{genericModel, genericBuilder, genericRows, genericFactory, genericNewModel, genericInstance} {
-			if strings.Contains(string(body), stale) {
-				t.Errorf("%s still spells the generic model layer %q", filepath.ToSlash(relative), stale)
+			value, err := strconv.Unquote(literal.Value)
+			if err != nil {
+				return true
 			}
-		}
-		if relative != "TranslateQuery.go" && strings.Contains(string(body), generatedHeading) {
-			t.Errorf("%s carries the heading of the generated query, which only TranslateQuery.go may", filepath.ToSlash(relative))
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("reading the Go files: %v", err)
+			if strings.Contains(value, "://") && !allowed[value] {
+				t.Errorf("%s names the address %s; the only addresses written in the code are DeepL's", source.path, literal.Value)
+			}
+			return true
+		})
 	}
 }
 
-// TestTheGuidesTeachTheGeneratedModelBoundary keeps configured packages from
-// inheriting a retired shape through their local instructions: the CRUD
-// Repository, the configured generic Model, and the handler that loaded the
-// session and mapped errors to statuses by hand.
-func TestTheGuidesTeachTheGeneratedModelBoundary(t *testing.T) {
+// TestTheGuidesTeachALibrary keeps the documents an installer and a maintainer
+// read in step with the package that exists. The template this package came
+// from taught a module that is constructed, registered and migrated, and a
+// guide that still taught any of it would send the next reader to write the
+// wiring this package refused.
+func TestTheGuidesTeachALibrary(t *testing.T) {
 	t.Parallel()
 
 	root := packageRoot(t)
 	guides := map[string][]string{
-		"AGENTS.md":                {"Translates(db)", "security.Authorize"},
-		"README.md":                {"Translates(db)", "TranslateQuery", "aru model:build", "RequireAuth"},
-		"CONTRIBUTING.md":          {"Translates(db)", "authorizes before reaching the Model", "aru model:build"},
-		"SECURITY.md":              {"Model terminal", "data.Tenant(g)"},
-		".agents/skills/README.md": {"TranslateQuery", "custom block"},
-		".agents/skills/translate-module/SKILL.md":  {"translateTable", "ctx.User()", "RequireAuth", "return err"},
-		".agents/skills/translate-policy/SKILL.md":  {"security.Authorize", "Translates(s.db).New()"},
-		".agents/skills/translate-release/SKILL.md": {"model:build --check", "configured copy"},
-		".agents/skills/translate-package/SKILL.md": {"RequireAuth", "/auth/login"},
+		"README.md": {
+			"go get github.com/hyz-is/arandu-translate", "translate.NewDeepL(", "translate.NewLibreTranslate(",
+			"translate.NewFake(", "translate.Fallback(", "translate.Translator", "translate.ErrQuotaExceeded",
+		},
+		"AGENTS.md": {"TestThePackageIsALibrary", "TestThePackageNamesNoHostButDeepL"},
+		".agents/skills/translate-package/SKILL.md": {
+			"go get github.com/hyz-is/arandu-translate", "translate.NewDeepL(", "translate.NewFake(", "translate.Translator",
+		},
+		".agents/skills/translate-release/SKILL.md": {"TestTheModuleRequiresNothing"},
+		".agents/skills/README.md":                  {"translate-package", "translate-release", "translate-vault-notes"},
 	}
 	retired := []string{
-		"TranslateRepository", "NewTranslateRepository", "repository.go  data access",
-		genericModel, genericBuilder, genericInstance,
-		"Model-first", "configured Model",
-		"m.answer(", "m.subject(", "Config.Tenant", "cfg.Auth.Tenant",
+		"translateModule", "k.Register", "WithProviders(", "TranslateService", "TranslatePolicy", "Translates(",
+		"model:build", "vendor:publish", "/auth/login", "aru migrate",
 	}
+
 	for path, required := range guides {
 		body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(path)))
 		if err != nil {
@@ -220,321 +142,46 @@ func TestTheGuidesTeachTheGeneratedModelBoundary(t *testing.T) {
 		}
 		for _, stale := range retired {
 			if strings.Contains(text, stale) {
-				t.Errorf("%s still teaches the retired shape %q", path, stale)
+				t.Errorf("%s still teaches the template's module through %q", path, stale)
 			}
 		}
 	}
 }
 
-// TestHandlersLeaveTheSubjectAndTheStatusToTheFramework holds the two things a
-// handler of this package no longer does for itself. RequireAuth loads the
-// session and puts the subject on the request, so a handler reads it with
-// ctx.User and nothing in the module loads a session again. The router's action
-// adapter turns an error into its status, so a handler returns the error and
-// neither inspects it nor writes a refusal of its own.
-//
-// It reads module.go as syntax. A handler that reached the session or wrote a
-// status through a helper of another name would pass it, which is why the
-// feature tests also drive the routes with and without a session.
-func TestHandlersLeaveTheSubjectAndTheStatusToTheFramework(t *testing.T) {
+// TestEverySkillIsNamedAfterItsDirectory holds the one line of a skill that a
+// tool reads as data: a skill whose frontmatter name and directory differ is
+// skipped, and nothing says so. It also holds which skill an application
+// receives -- the package skill, and no other.
+func TestEverySkillIsNamedAfterItsDirectory(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join(packageRoot(t), "module.go")
-	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	dir := filepath.Join(packageRoot(t), ".agents", "skills")
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("parsing module.go: %v", err)
+		t.Fatalf("reading the skills: %v", err)
 	}
-
-	methods := map[string]*ast.FuncDecl{}
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if ok && receiverType(function) == "Module" {
-			methods[function.Name.Name] = function
-		}
-	}
-	routes := methods["Routes"]
-	if routes == nil {
-		t.Fatal("Module has no Routes method")
-	}
-
-	// The guard is mounted on the router before the first route is registered
-	// on it, so no route of this package is reachable without a session.
-	guarded, registered := token.NoPos, token.NoPos
-	ast.Inspect(routes.Body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		switch name := selectorName(call.Fun); {
-		case name == "RequireAuth" && guarded == token.NoPos:
-			guarded = call.Pos()
-		case routeVerbs[name] && registered == token.NoPos:
-			registered = call.Pos()
-		}
-		return true
-	})
-	if guarded == token.NoPos {
-		t.Error("Routes mounts no RequireAuth, so a request with no session reaches the handlers")
-	} else if registered != token.NoPos && guarded > registered {
-		t.Error("Routes registers a route before it mounts RequireAuth")
-	}
-
-	// Nothing in the module loads the session: the guard already did.
-	ast.Inspect(file, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if ok && selectorName(call.Fun) == "Load" {
-			t.Errorf("module.go calls %s, loading the session RequireAuth already loaded; read ctx.User instead",
-				spelled(call.Fun))
-		}
-		return true
-	})
-
-	handlers := registeredHandlers(routes)
-	if len(handlers) == 0 {
-		t.Fatal("Routes registers no Module handler")
-	}
-	for name := range handlers {
-		handler := methods[name]
-		if handler == nil {
-			t.Errorf("Routes registers Module.%s, but no such method exists", name)
+	found := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
 			continue
 		}
-		readsUser := false
-		ast.Inspect(handler.Body, func(node ast.Node) bool {
-			call, ok := node.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			switch selectorName(call.Fun) {
-			case "User":
-				readsUser = true
-			case "Refuse", "Reject":
-				t.Errorf("Module.%s answers through %s by hand; return the error and let the router answer it",
-					name, spelled(call.Fun))
-			case "Error":
-				if owner, ok := call.Fun.(*ast.SelectorExpr); ok {
-					if pkg, ok := owner.X.(*ast.Ident); ok && (pkg.Name == "http" || pkg.Name == "stdhttp") {
-						t.Errorf("Module.%s writes a status with %s; return the error and let the router answer it",
-							name, spelled(call.Fun))
-					}
-				}
-			case "Is", "As":
-				if owner, ok := call.Fun.(*ast.SelectorExpr); ok {
-					if pkg, ok := owner.X.(*ast.Ident); ok && pkg.Name == "errors" {
-						t.Errorf("Module.%s inspects the error with errors.%s to choose a status; the router does that",
-							name, owner.Sel.Name)
-					}
-				}
-			}
-			return true
-		})
-		if !readsUser {
-			t.Errorf("Module.%s does not read who is asking with ctx.User", name)
-		}
-	}
-}
-
-// routeVerbs are the router methods that register a route, as distinct from the
-// ones that build a group or a middleware chain around it.
-var routeVerbs = map[string]bool{
-	"Action": true, "Resource": true, "Match": true,
-	"Get": true, "Post": true, "Put": true, "Patch": true, "Delete": true,
-}
-
-// spelled is a selector as it is written, for a message.
-func spelled(expression ast.Expr) string {
-	switch expression := expression.(type) {
-	case *ast.SelectorExpr:
-		return spelled(expression.X) + "." + expression.Sel.Name
-	case *ast.Ident:
-		return expression.Name
-	}
-	return "a call"
-}
-
-// inspectExplicitComposition rejects the names that would make registration
-// implicit. AppServiceProvider is the deliberate nominal exception: when it is
-// present it remains a Module, with no Register lifecycle of its own.
-func inspectExplicitComposition(t *testing.T, root string) {
-	t.Helper()
-
-	forbiddenFunctions := map[string]bool{
-		"DiscoverProviders": true,
-		"Providers":         true,
-		"RegisterProvider":  true,
-		"RegisterProviders": true,
-		"ResolveProvider":   true,
-		"ResolveProviders":  true,
-	}
-	appProviderFound := false
-	appProviderMethods := map[string]bool{}
-
-	for _, source := range productionGoFiles(t, root) {
-		compositionAliases := map[string]bool{}
-		for _, imported := range source.file.Imports {
-			path, err := strconv.Unquote(imported.Path.Value)
-			if err != nil {
-				t.Errorf("%s has an unreadable import %s", source.path, imported.Path.Value)
-				continue
-			}
-			if strings.Contains(path, "/container/") || strings.HasSuffix(path, "/container") {
-				t.Errorf("%s imports the container surface %s", source.path, path)
-			}
-			defaultName := ""
-			switch path {
-			case "github.com/arandu-io/framework/foundation", "github.com/arandu-io/hesape/foundation":
-				defaultName = "foundation"
-			case "github.com/arandu-io/framework/kernel":
-				defaultName = "kernel"
-			}
-			if defaultName != "" {
-				name := defaultName
-				if imported.Name != nil {
-					name = imported.Name.Name
-				}
-				if name == "." || name == "_" {
-					t.Errorf("%s hides composition behind the import alias %q", source.path, name)
-					continue
-				}
-				compositionAliases[name] = true
-			}
-		}
-
-		ast.Inspect(source.file, func(node ast.Node) bool {
-			switch node := node.(type) {
-			case *ast.TypeSpec:
-				if node.Name.Name != "Provider" && !strings.HasSuffix(node.Name.Name, "ServiceProvider") {
-					return true
-				}
-				if node.Name.Name == "AppServiceProvider" {
-					appProviderFound = true
-					return true
-				}
-				t.Errorf("%s declares %s, a second composition abstraction", source.path, node.Name.Name)
-			case *ast.FuncDecl:
-				if node.Recv == nil && forbiddenFunctions[node.Name.Name] {
-					t.Errorf("%s declares %s, which makes module registration implicit", source.path, node.Name.Name)
-				}
-				if receiverType(node) == "AppServiceProvider" {
-					appProviderMethods[node.Name.Name] = true
-				}
-			case *ast.SelectorExpr:
-				name, ok := node.X.(*ast.Ident)
-				if ok && compositionAliases[name.Name] && node.Sel.Name == "Provider" {
-					t.Errorf("%s uses a Provider contract instead of Module", source.path)
-				}
-			}
-			return true
-		})
-	}
-
-	if !appProviderFound {
-		return
-	}
-	for _, method := range []string{"Name", "Routes"} {
-		if !appProviderMethods[method] {
-			t.Errorf("AppServiceProvider exists without the Module method %s", method)
-		}
-	}
-	if appProviderMethods["Register"] {
-		t.Error("AppServiceProvider declares a container-style Register lifecycle")
-	}
-}
-
-// inspectServiceBoundary reads the route table rather than fixing a list of
-// handler names in the test. Every handler registered there must call a Service
-// and may not name a Repository directly.
-func inspectServiceBoundary(t *testing.T, root string) {
-	t.Helper()
-
-	path := filepath.Join(root, "module.go")
-	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-	if err != nil {
-		t.Fatalf("parsing module.go: %v", err)
-	}
-
-	serviceFields := map[string]bool{}
-	methods := map[string]*ast.FuncDecl{}
-	var routes *ast.FuncDecl
-
-	for _, declaration := range file.Decls {
-		switch declaration := declaration.(type) {
-		case *ast.GenDecl:
-			for _, specification := range declaration.Specs {
-				typeSpec, ok := specification.(*ast.TypeSpec)
-				if !ok || typeSpec.Name.Name != "Module" {
-					continue
-				}
-				structure, ok := typeSpec.Type.(*ast.StructType)
-				if !ok {
-					t.Fatal("Module is not a struct")
-				}
-				for _, field := range structure.Fields.List {
-					fieldType := namedType(field.Type)
-					if strings.HasSuffix(fieldType, "Repository") {
-						t.Errorf("Module holds %s directly; handlers must reach data through a Service", fieldType)
-					}
-					if !strings.HasSuffix(fieldType, "Service") {
-						continue
-					}
-					for _, name := range field.Names {
-						serviceFields[name.Name] = true
-					}
-				}
-			}
-		case *ast.FuncDecl:
-			if receiverType(declaration) != "Module" {
-				continue
-			}
-			methods[declaration.Name.Name] = declaration
-			if declaration.Name.Name == "Routes" {
-				routes = declaration
-			}
-		}
-	}
-
-	if len(serviceFields) == 0 {
-		t.Fatal("Module has no Service collaborator for use-case orchestration")
-	}
-	if routes == nil {
-		t.Fatal("Module has no Routes method")
-	}
-
-	handlers := registeredHandlers(routes)
-	if len(handlers) == 0 {
-		t.Fatal("Routes registers no Module handler")
-	}
-	for name := range handlers {
-		handler := methods[name]
-		if handler == nil {
-			t.Errorf("Routes registers Module.%s, but no such method exists", name)
+		found++
+		body, err := os.ReadFile(filepath.Join(dir, entry.Name(), "SKILL.md"))
+		if err != nil {
+			t.Errorf("%s has no SKILL.md: %v", entry.Name(), err)
 			continue
 		}
-
-		usesService := false
-		receiver := receiverName(handler)
-		ast.Inspect(handler.Body, func(node ast.Node) bool {
-			switch node := node.(type) {
-			case *ast.SelectorExpr:
-				field, ok := node.X.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				owner, ownedByModule := field.X.(*ast.Ident)
-				if ownedByModule && owner.Name == receiver && serviceFields[field.Sel.Name] {
-					usesService = true
-				}
-			case *ast.Ident:
-				if strings.HasSuffix(node.Name, "Repository") || strings.EqualFold(node.Name, "repository") ||
-					strings.EqualFold(node.Name, "repo") {
-					t.Errorf("Module.%s reaches %s directly; use the Service boundary", name, node.Name)
-				}
-			}
-			return true
-		})
-		if !usesService {
-			t.Errorf("Module.%s does not delegate its use case to a Service", name)
+		text := string(body)
+		if !strings.HasPrefix(text, "---\nname: "+entry.Name()+"\n") {
+			t.Errorf("%s/SKILL.md does not open with name: %s", entry.Name(), entry.Name())
 		}
+		forApplications := strings.Contains(text, "\nmetadata:\n  audience: app\n")
+		if want := entry.Name() == "translate-package"; forApplications != want {
+			t.Errorf("%s: audience app = %v, want %v", entry.Name(), forApplications, want)
+		}
+	}
+	if found != 3 {
+		t.Errorf("found %d skills, want translate-package, translate-release and translate-vault-notes", found)
 	}
 }
 
@@ -579,39 +226,6 @@ func productionGoFiles(t *testing.T, root string) []parsedGoFile {
 	return files
 }
 
-// registeredHandlers is every method of the receiver handed to a call that
-// registers a route. Only those calls: the guard is mounted with a call that
-// takes a field of the receiver too, and a field is not a handler.
-func registeredHandlers(routes *ast.FuncDecl) map[string]bool {
-	handlers := map[string]bool{}
-	receiver := receiverName(routes)
-	ast.Inspect(routes.Body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok || !routeVerbs[selectorName(call.Fun)] {
-			return true
-		}
-		for _, argument := range call.Args {
-			handler, ok := argument.(*ast.SelectorExpr)
-			if !ok {
-				continue
-			}
-			owner, ok := handler.X.(*ast.Ident)
-			if ok && owner.Name == receiver {
-				handlers[handler.Sel.Name] = true
-			}
-		}
-		return true
-	})
-	return handlers
-}
-
-func receiverName(function *ast.FuncDecl) string {
-	if function.Recv == nil || len(function.Recv.List) == 0 || len(function.Recv.List[0].Names) == 0 {
-		return ""
-	}
-	return function.Recv.List[0].Names[0].Name
-}
-
 func receiverType(function *ast.FuncDecl) string {
 	if function.Recv == nil || len(function.Recv.List) == 0 {
 		return ""
@@ -627,10 +241,6 @@ func namedType(expression ast.Expr) string {
 		return namedType(expression.X)
 	case *ast.SelectorExpr:
 		return expression.Sel.Name
-	case *ast.IndexExpr:
-		return namedType(expression.X)
-	case *ast.IndexListExpr:
-		return namedType(expression.X)
 	default:
 		return ""
 	}

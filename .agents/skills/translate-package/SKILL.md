@@ -1,214 +1,108 @@
 ---
 name: translate-package
-description: Install, wire and use the Translate package (Go, Arandu) in an application. Use when the request is to "install Translate", "add translate to the app", "go get github.com/hyz-is/arandu-translate", "wire it into bootstrap/app.go", "register the module", "use the translate routes", "everything under /translate returns 403", "403 forbidden from translate", "it redirects to /auth/login", "the table does not exist", "no such table", "change where it is mounted", "let admins read it", or when a project's go.mod already requires github.com/hyz-is/arandu-translate. Covers the wiring and where each part goes, publishing and linking the views, the Config fields, none of them required, the routes, their names and the session they need, why the policy refuses everything until somebody opens it, and the migration step that is not optional.
+description: Translate text in an Arandu application with Arandu Translate. Use when the request is to "translate the catalogue", "machine translation", "translate this text", "DeepL", "LibreTranslate", "add a translation provider", "fall back to another translator", "go get github.com/hyz-is/arandu-translate", "ErrQuotaExceeded", "ErrUnauthorized", "ErrUnsupportedLanguage", "which languages can we translate into", "test the code that translates", or when a project's go.mod already requires github.com/hyz-is/arandu-translate. Covers the key, the drivers built once and kept as a translate.Translator, Fallback, the BCP 47 tags, the errors, and the Fake for tests.
 license: MIT
 metadata:
   audience: app
 ---
 
-# Using Translate
+# Using Arandu Translate
 
-An Arandu package with one entity, its own table, its own routes and its own
-policy. It is registered by hand — there is no service provider, no container
-and no discovery, so if a line is not written in the application, it does not
-happen.
+Three pieces, each a few lines the application writes. Nothing is registered:
+there is no module, no route and no migration.
 
-## Install
+## 1. The key and the privacy
 
-```bash
-go get github.com/hyz-is/arandu-translate
+An account at DeepL gives a key; a LibreTranslate server may ask for one. The key
+belongs to whoever holds the account and every request spends that account's
+characters. It goes in `.env` and in the deployment's secrets, never in the
+repository:
+
+```dotenv
+DEEPL_API_KEY=...
+LIBRETRANSLATE_URL=http://localhost:5000
 ```
 
-## The wiring, and where each part goes
+The text leaves the application and goes to the provider. DeepL API Free (key
+ending `:fx`) and API Pro have different terms for retention and for using texts
+to improve the service: use Pro or a self-hosted LibreTranslate for anything
+personal, and name the providers in the privacy notice.
 
-All of it is in `bootstrap/app.go`. `aru make:module` does not edit this file for
-you, and the views the package carries have to be published and linked, below.
+## 2. The drivers, built once
 
-The import, with the other module imports:
+```sh
+go get github.com/hyz-is/arandu-translate@v0.1.0
+```
 
 ```go
-import (
-	translate "github.com/hyz-is/arandu-translate"
-)
+deepl, err := translate.NewDeepL(translate.DeepLConfig{APIKey: os.Getenv("DEEPL_API_KEY")})
+if err != nil {
+	return err // an empty key, or a BaseURL that is not http or https
+}
+libre, err := translate.NewLibreTranslate(translate.LibreConfig{BaseURL: os.Getenv("LIBRETRANSLATE_URL")})
+if err != nil {
+	return err
+}
+var t translate.Translator = translate.Fallback(deepl, libre)
 ```
 
-The construction, in `App`, once `NewAppServiceProvider` has returned. `New`
-refuses a wiring that cannot work and `Configure` has no way to return that
-error, so the module is built where the error can leave. The database and the
-session store are the ones the framework built from the configuration:
+Keep it where the application keeps its services (explicit wiring, for example in
+`bootstrap/app.go`), and give the code that translates a `translate.Translator`,
+not a `*translate.DeepL`, so a test can hand it `translate.NewFake()`.
+
+## 3. The calls
 
 ```go
-	translateModule, err := translate.New(translate.Config{}, drivers.DB, drivers.Sessions)
-	if err != nil {
-		_ = drivers.Close()
-		return nil, err
-	}
+res, err := t.Translate(ctx, translate.Request{Text: []string{"Bienvenue"}, Source: "fr", Target: "pt-BR"})
+langs, err := t.Languages(ctx) // the targets, as BCP 47
 ```
 
-And the registration, in the `WithProviders(...)` chain the builder is made of:
+- Tags are BCP 47 on both sides: `fr`, `pt-BR`, `zh-Hans`, `ar`. Never a
+  provider's own code (`PT-BR`, `zt`); the driver maps them.
+- `Text` is a list and the answer keeps its order. Empty texts come back empty and
+  cost nothing. Send short texts, not whole documents.
+- `Source` empty means the provider detects it; `res.DetectedSource` says what it
+  found, when it says.
+- `Format: "html"` keeps the tags. The default is plain text.
+- `res.Provider` names who answered, which matters with `Fallback`.
+- Translate a catalogue once and store the result in the application; do not
+  translate on every request.
+
+## Errors
+
+`errors.Is(err, translate.ErrQuotaExceeded)`: out of characters or requests. Do not
+retry in a loop; tell the operator or try later. `ErrUnauthorized`: the key was
+refused; retrying will not help. `ErrUnsupportedLanguage`: the provider does not
+translate into or from that language; check `Languages` first. With `Fallback`,
+the error joins every provider's, so `errors.Is` finds each. Anything else is the
+provider's own message. No error carries the key.
+
+## What the package does not do
+
+- It stores nothing and caches nothing.
+- It does not retry or wait.
+- It does not judge quality: a machine translation of legal or brand text needs a
+  person.
+
+## Tests
 
 ```go
-	return Configure(cfg, drivers, app).
-		WithProviders(translateModule).
-		WithVersion(version, commit).
-		Create()
+fake := translate.NewFake()
+res, _ := fake.Translate(ctx, translate.Request{Text: []string{"bonjour"}, Target: "pt-BR"})
+// res.Text == []string{"[pt-BR] bonjour"}
+fake.SetLanguages([]string{"en", "pt-BR"}) // other targets now fail with ErrUnsupportedLanguage
+fake.FailWith(translate.ErrQuotaExceeded)  // FailWith(nil) undoes it
+asked := fake.Requests()
 ```
 
-`New` returns an error rather than starting half-wired. It refuses a
-configuration that cannot work, a nil database handle and a nil session store,
-so a wiring mistake costs one restart instead of arriving as a nil dereference
-on the first request that needed it.
+No test of the application should reach the network.
 
-## Then publish and link the views
+## Symptoms
 
-The package carries the markup of its own pages and hands it over, and it
-refuses to boot until the project has linked it. Publish them, then compile them:
-
-```bash
-aru vendor:publish --tag=view
-aru vendor:publish --tag=view --apply
-aru view:build
-```
-
-The first line only previews; nothing is written without `--apply`. The files
-land under `resources/views/modules/translate/` and are the project's from
-then on. `aru view:build` compiles them, and the compiled package is imported
-with the other blank imports of `bootstrap/app.go`:
-
-```go
-	_ "your/module/path/storage/framework/views/modules/translate"
-```
-
-**Symptom to recognise:** the application stops at boot with an error naming the
-view, the command and the import. One of the steps is missing, and the import
-is the usual one.
-
-## Then run the migrations
-
-```bash
-aru migrate
-```
-
-Not optional, and not automatic. The package owns a table, which is why its
-`arandu.mod.toml` declares `migrations = true` — that declaration is how an
-installer finds out before deploying rather than from the first request.
-
-`aru migrate` is a step in the pipeline and never a call at the start of the
-process: with N replicas, N migrations race each other.
-
-**Symptom to recognise:** `no such table`, or `relation does not exist`, from a
-route that authorized correctly. The migration has not run.
-
-## Configuration
-
-| field | required | meaning |
-| --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/translate` |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200 |
-
-`translate.Config{}` is a complete configuration. There is no tenant to pass:
-every route needs a session, and the tenant of every statement comes from
-`data.Tenant(g)`, off the Grant of whoever is signed in. Passing a value the
-request named — a path segment, a header, a subdomain read off the URL — is what
-`TestNoTenantIsReadOutOfTheRequest` fails on in the package. In an application
-the same mistake is `aru doctor`'s `tenant-from-request`; in a package nothing
-but the package's own suite looks.
-
-`PageSize` above 200 is an error from `New`, not a silent 200. A number somebody
-wrote and did not get is worse than a number somebody wrote and was told about.
-
-## Routes
-
-| method | path | name |
-| --- | --- | --- |
-| `GET` | `/translate` | `translate.index` |
-| `GET` | `/translate/{id}` | `translate.show` |
-| `POST` | `/translate` | `translate.store` |
-
-Every route sits behind `RequireAuth`, mounted by the package itself. A request
-with no session is sent to `/auth/login` — 303, or `YPY-Redirect` for a YPY
-request — and comes back to the address it asked for after signing in. That is
-the sign-in screen the starter kit publishes; an application without one sees
-a 404 there.
-
-**Symptom to recognise:** every route of the package redirects to
-`/auth/login`. Nobody is signed in on that request: the session cookie did not
-arrive, or the session store passed to `New` is not the one the application
-signs people in with.
-
-Build URLs from the names, never by writing the path a second time. `aru
-route:list` shows them grouped by module. Under a custom `Prefix` the paths move
-and the names do not.
-
-`GET /translate` answers `{"data": {"items": [...]}}`, and adds
-`"next_cursor"` beside `data` when a further page exists. Pass it back as
-`?cursor=`. A page shorter than `PageSize` is the last one and carries no
-cursor.
-
-`TenantID` is not in any response. That is deliberate: it names a customer's
-identifier and the response is a declared list of fields rather than the entity.
-
-## Every route refuses everybody, until you open the policy
-
-This is the state the package ships in, and it is not a bug to work around.
-`TranslatePolicy` denies every action and has no branch that allows one:
-
-```
-403 Forbidden
-```
-
-is what a correctly installed, correctly migrated, correctly wired package
-answers to an administrator who is signed in, on day one.
-
-Opening an action means writing the rule that opens it, in the package's
-`policy.go`, inside the block that says so:
-
-```go
-	// arandu:begin custom
-	if a == TranslateView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
-	}
-	// arandu:end custom
-```
-
-What is not written there stays closed, including every action added later.
-There are five actions — `TranslateView`, `TranslateList`, `TranslateCreate`,
-`TranslateUpdate`, `TranslateDelete` — and opening one opens exactly one.
-
-**Do not open it from the application.** There is no hook, no override and no
-config flag for the policy, and adding one would be a second place where
-authorization is decided. If the rules this application needs are not the rules
-the package ships, the change belongs in the package.
-
-## What the answers mean
-
-| status | what happened |
+| symptom | piece |
 | --- | --- |
-| `303` to `/auth/login` | there is no session on the request |
-| `403` | the policy refused, or no rule allows the action yet |
-| `404` | no row with that id in this tenant |
-| `303` back to the page the request came from | the input was rejected; the messages and what was typed are in the flash |
-| `422` `application/problem+json` | the input was rejected and the request asked for JSON; the messages are in `errors`, keyed by field |
-
-A request that asks for JSON (an `Accept` naming `application/json`, or an XHR
-that is not a YPY request) gets the 403 and the 404 as problem documents too. The
-sign-in redirect is the same for every client.
-
-The package does not choose these: its handlers return what the service
-returned, and the framework's router answers it. A refusal carries no detail
-beyond the status and its standard sentence. Telling a client why a policy said
-no tells it what exists and what does not, one request at a time. The reason is
-in the log.
-
-Anything else is a 500 and the framework's error page in development. The
-package returns unexpected errors rather than swallowing them, so a route that
-answers 200 with an empty body is not something it does.
-
-## Reporting a problem
-
-Issues and pull requests go to the repository the module path names,
-`github.com/hyz-is/arandu-translate`, which belongs to `hyz-is`. A vulnerability goes to the
-private advisory form named in that repository's `SECURITY.md`, and never into
-an issue.
-
-MIT licensed. Copyright HYZIS.
+| `translate: DeepLConfig.APIKey is empty` | 1: the variable is not set in this environment |
+| `ErrUnauthorized` on every call | 1: wrong key, or a Free key against a Pro account |
+| `ErrQuotaExceeded` after a while | 3: the month's characters are spent; translate once and store |
+| `ErrUnsupportedLanguage` for `pt` or `zh` | 3: use `pt-BR` and `zh-Hans`; ask `Languages` |
+| the Chinese comes out traditional | 3: send `zh-Hans`; `zh-Hant` and `zh-TW` are traditional |
